@@ -1,0 +1,170 @@
+import pymongo
+import math 
+# import re
+import pandas as pd
+# import numpy as np
+import pylab 
+from matplotlib import pyplot as plt
+# from scipy import stats 
+from  qgrid import show_grid as show 
+from datetime import datetime
+from powerapi.formula import RAPLFormulaHWPCReportHandler, FormulaState
+from powerapi.report import HWPCReport
+import seaborn as sns
+
+
+class testCase(object): 
+    """in general its just the name of the machine where we launched the test """
+    def __init__ (self , testname,database='variation',serveraddr='172.16.45.8',serverport=27017): 
+        self._client = pymongo.MongoClient(serveraddr, serverport)
+        self._db=self._client[database]
+        self._testname=testname 
+        self._rapl=self._db['rapl'+self._testname]
+        self._snmp=self._db['snmp'+self._testname]
+        self._rapl.create_index([('timestamp',pymongo.ASCENDING)])
+        self._formula_id = (None,)
+        self._state = FormulaState(None, None, None, self._formula_id)
+        self._handler = RAPLFormulaHWPCReportHandler(None)
+        
+    def gettimetamps(self,containername): 
+        containerdata=list(self._rapl.find({'target':containername},projection=['timestamp']))
+        begintime= containerdata[0]['timestamp']
+        endtime=containerdata[-1]['timestamp']
+        return begintime , endtime , len(containerdata)
+    
+    def _get_snmp(self,row): 
+        x= self._snmp.find_one({'timestamp':math.floor(row['timestamp'].timestamp())})
+        return x['power'] if x else 0
+
+    def _process_power(self,row,socket,event):
+        hwpc_report = HWPCReport.deserialize(row)
+#         if event=='SNMP': 
+#             return self._get_snmp(row)
+        for i in self._handler._process_report(hwpc_report, self._state) : 
+            if i.metadata['socket']== socket and i.metadata['event']==event : 
+                return i.power
+        return -1 
+    
+    
+    def _get_headers(self,row):
+        hwpc_report = HWPCReport.deserialize(row)
+        x=self._handler._process_report(hwpc_report,self._state)
+        l=[(i.metadata['socket'],i.metadata['event']) for i in x ]
+#         if self._snmp.count()>0 :
+#             l.append(('all','SNMP'))
+        return l
+    
+    def getpowers(self,containername): 
+        #get the power consumption of the system  between begin and end 
+        begin , end,number = self.gettimetamps(containername) 
+        x=list(self._rapl.find({'target':'all','timestamp' :{'$gte':begin,'$lte':end}}))
+        conso= pd.DataFrame(x)
+
+        headers=self._get_headers(x[0])
+        for i in headers: 
+            socket,event=i 
+            title="powers_{}_{}".format(event.split('_')[-1],socket)
+            conso[title]=conso.T.apply(lambda row: self._process_power(row,socket,event))
+
+        return conso.drop(["_id","groups","sensor","target"],axis=1)
+        
+    def getpowersFromInterval(self,begin,end): 
+        #get the power consumption of the system  between begin and end 
+#         begin , end = self.gettimetamps(containername) 
+        x=list(self._rapl.find({'target':'all','timestamp' :{'$gte':begin,'$lte':end}})) 
+        conso= pd.DataFrame(x)
+
+        headers=self._get_headers(x[0])
+        for i in headers: 
+            socket,event=i 
+            title="powers_{}_{}".format(event.split('_')[-1],socket)
+            conso[title]=conso.T.apply(lambda row: self._process_power(row,socket,event))
+
+        return conso.drop(["_id","groups","sensor","target"],axis=1)
+   
+    def getenergy(self,containername):
+        powers =self.getpowers(containername)
+        powers=powers.loc[:,[ i for i in powers.columns if 'powers_' in i ]]
+        return powers.sum()    
+    
+    def getenergyfromInterval(self,begin,end):
+        powers =self.getpowersFromInterval(begin,end)
+        powers=powers.loc[:,[ i for i in powers.columns if 'powers_' in i ]]
+        return powers.sum()
+    
+    def getTargets(self): 
+        x=pd.DataFrame(list(self._rapl.find(projection={'target':True,'_id':False}))).drop_duplicates()
+        return x.loc[ (x['target'] !='all') & (x['target'] != 'zmartwatts-sensor')] 
+#         x.drop(index="zmartwatts-sensor")
+        
+    def getrecap(self):
+        recap=self.getTargets()
+        recapenergy=recap.T.apply(lambda row: self.getenergy(row['target'])).T
+        energies=pd.concat([recap,recapenergy],axis=1)
+        times=recap.T.apply(lambda row: self.gettimetamps(row['target'])).T
+        beginTimes={i:times[i][0] for i in times.keys()}
+        endTimes={i:times[i][1] for i in times.keys()}
+        entryNumber={i:times[i][2] for i in times.keys()}
+        energies['begin']=energies.T.apply(lambda row:beginTimes[row.name])
+        energies['end']=energies.T.apply(lambda row:endTimes[row.name])
+        energies['entrynumber']=energies.T.apply(lambda row:entryNumber[row.name])
+#         energies['duration']=energies.T.apply(lambda row:(row['end']-row['begin']).total_seconds())
+        allpowers={'powers_'+i.split('_')[1]+'_all' for i in recapenergy.columns if 'powers' in i  }
+        for i in allpowers: 
+            energies[i]=energies.T.apply(lambda row : sum([row[j] for j in row.index if i.split('_')[1] in j]))
+        self._recap = energies
+        return energies
+    
+
+def describe(recap):
+    pd.options.display.float_format = '{:,.3f}'.format
+    l=normalize(recap)
+    return l.groupby('type').describe()
+
+def normalize(recap2):
+    l=pd.DataFrame()
+#     pd.options.display.float_format = '{:,.3f}'.format
+    for j in recap2.groupby("type"): 
+        data=pd.DataFrame(j[1])
+        data["type"]=j[0]
+        for i in recap2.columns : 
+            if 'powers' in i :
+                length=(data[i].max()-data[i].min())
+                mean=data[i].mean()
+                data["normalized_"+i]=data[i].apply(lambda val:(val-mean)/length) 
+        l=pd.concat([l,data], sort=False)
+        
+    return l
+
+
+
+def boxplot(data1,measure,default_palette,ax=None):
+    plt.figure(figsize=(20, 10))
+    sns.set_style("whitegrid")
+    description=data1.groupby("type").describe()[measure]
+    x_order=list(description.sort_values("std").index)
+    custom_palette=[default_palette[i] for i in x_order]
+    ax=sns.boxplot(data=data1,y=measure,x="type",order=x_order,palette=custom_palette,ax=ax)
+    ax.set_title(measure)
+    pos=range(len(x_order))
+    for tick,label in zip(pos,ax.get_xticklabels()):
+        ax.text(pos[tick],description.loc[x_order[tick]]["max"]+0.03, x_order[tick],horizontalalignment='center', weight='semibold')
+
+def getpalette(data1,original_measure="normalized_powers_PKG_all"):
+    x_list=list(describe(data1)[original_measure].sort_values("std").index)
+    p=sns.color_palette("muted",len(x_list))
+    return dict(zip(x_list,p))
+
+
+
+def hboxplot(data1,measure,default_palette,ax=None):
+    plt.figure(figsize=(20, 10))
+    description=data1.groupby("type").describe()[measure]
+    description["irq"]=description["75%"]-description["25%"]
+    x_order=list(description.sort_values("irq").index)
+    custom_palette=[default_palette[i] for i in x_order]
+    ax=sns.boxplot(data=data1,whis="range",orient="h",x=measure,y="type",order=x_order,palette=custom_palette,ax=ax)
+    ax.set_title(measure,size=20)
+    pos=range(len(x_order))
+    for tick,label in zip(pos,ax.get_xticklabels()):
+        ax.text(description.loc[x_order[tick]]["50%"],pos[tick], description.loc[x_order[tick]]["irq"],horizontalalignment='center', weight='semibold')
