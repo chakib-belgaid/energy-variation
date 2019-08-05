@@ -1,7 +1,7 @@
 docker run --privileged --name powerapi-sensor -td \
     -v /sys:/sys -v /tmp/docker/containers:/var/lib/docker/containers:ro \
     -v /tmp/powerapi-sensor-$(date +%s):/reporting \
-    powerapi/hwpc-sensor \
+    powerapi/hwpc-sensor:0.1.1 \
     -n "$(hostname -f)" \
     -r "csv" -U "/reporting" \
     -s "rapl" -o -e "RAPL_ENERGY_PKG" -e "RAPL_ENERGY_DRAM" \
